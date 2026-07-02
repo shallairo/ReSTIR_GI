@@ -1,0 +1,221 @@
+#include "/Engine/Public/Platform.ush"
+
+#define RESTIRGI_DEBUG_COMPOSITE 0
+#define RESTIRGI_DEBUG_INITIAL_ONLY 1
+#define RESTIRGI_DEBUG_TEMPORAL 2
+#define RESTIRGI_DEBUG_SPATIAL 3
+#define RESTIRGI_DEBUG_RESERVOIR_WEIGHT 4
+#define RESTIRGI_DEBUG_SAMPLE_AGE 5
+#define RESTIRGI_DEBUG_HEATMAP 6
+#define RESTIRGI_DEBUG_WIPE_COMPARE 7
+#define RESTIRGI_DEBUG_SIDE_BY_SIDE 8
+
+struct FReSTIRGIPackedReservoir
+{
+	float4 SamplePositionAndWeight;
+	float4 SampleNormalAndPdf;
+	float4 RadianceAndM;
+	uint4 Misc;
+};
+
+Texture2D<float4> SceneColorTexture;
+SamplerState SceneColorSampler;
+
+RWStructuredBuffer<FReSTIRGIPackedReservoir> InitialReservoir;
+StructuredBuffer<FReSTIRGIPackedReservoir> HistoryReservoir;
+StructuredBuffer<FReSTIRGIPackedReservoir> SourceReservoir;
+StructuredBuffer<FReSTIRGIPackedReservoir> FinalReservoir;
+RWStructuredBuffer<FReSTIRGIPackedReservoir> TemporalReservoir;
+RWStructuredBuffer<FReSTIRGIPackedReservoir> SpatialReservoir;
+RWStructuredBuffer<FReSTIRGIPackedReservoir> HistoryReservoirOutput;
+RWTexture2D<float4> OutputTexture;
+
+int2 ViewSize;
+uint FrameIndex;
+uint ResamplingMode;
+uint DebugView;
+uint SpatialSampleCount;
+uint MaxHistoryLength;
+float SpatialRadius;
+float NormalThreshold;
+float DepthThreshold;
+float RoughnessMISClamp;
+float RadianceClamp;
+float CompareSplit;
+uint bFinalMIS;
+uint bFinalVisibility;
+uint bHistoryValid;
+
+uint ReservoirIndex(uint2 Pixel)
+{
+	return Pixel.y * ViewSize.x + Pixel.x;
+}
+
+bool IsInside(uint2 Pixel)
+{
+	return Pixel.x < (uint)ViewSize.x && Pixel.y < (uint)ViewSize.y;
+}
+
+float Hash12(uint2 P)
+{
+	uint State = P.x * 1664525u + P.y * 1013904223u + FrameIndex * 747796405u;
+	State ^= State >> 16;
+	State *= 2246822519u;
+	State ^= State >> 13;
+	return (State & 0x00ffffffu) / 16777215.0f;
+}
+
+FReSTIRGIPackedReservoir EmptyReservoir()
+{
+	FReSTIRGIPackedReservoir R;
+	R.SamplePositionAndWeight = 0;
+	R.SampleNormalAndPdf = float4(0, 0, 1, 1);
+	R.RadianceAndM = 0;
+	R.Misc = 0;
+	return R;
+}
+
+FReSTIRGIPackedReservoir MakeReservoir(float3 SamplePosition, float3 SampleNormal, float3 Radiance, float Pdf, uint Age)
+{
+	FReSTIRGIPackedReservoir R;
+	const float SafePdf = max(Pdf, 1e-4);
+	const float Luma = dot(Radiance, float3(0.2126, 0.7152, 0.0722));
+	const float Weight = saturate(Luma / SafePdf);
+	R.SamplePositionAndWeight = float4(SamplePosition, Weight);
+	R.SampleNormalAndPdf = float4(normalize(SampleNormal), SafePdf);
+	R.RadianceAndM = float4(min(Radiance, (float3)RadianceClamp), 1.0);
+	R.Misc = uint4(Age, 0, 0, 0);
+	return R;
+}
+
+FReSTIRGIPackedReservoir CombineReservoirs(FReSTIRGIPackedReservoir A, FReSTIRGIPackedReservoir B, float RandomValue)
+{
+	const float WeightA = max(A.SamplePositionAndWeight.w, 0.0);
+	const float WeightB = max(B.SamplePositionAndWeight.w, 0.0);
+	const float Sum = WeightA + WeightB;
+	if (Sum <= 1e-5)
+	{
+		return A;
+	}
+
+	FReSTIRGIPackedReservoir OutR = (RandomValue < WeightB / Sum) ? B : A;
+	OutR.SamplePositionAndWeight.w = Sum * 0.5;
+	OutR.RadianceAndM.w = max(1.0, A.RadianceAndM.w + B.RadianceAndM.w);
+	OutR.Misc.x = min(MaxHistoryLength, max(A.Misc.x, B.Misc.x) + 1);
+	return OutR;
+}
+
+float3 Heat(float X)
+{
+	X = saturate(X);
+	return saturate(float3(1.5 * X, 1.5 - abs(X - 0.5) * 3.0, 1.5 * (1.0 - X)));
+}
+
+[numthreads(8, 8, 1)]
+void InitialSampleCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	const uint2 Pixel = DispatchThreadId.xy;
+	if (!IsInside(Pixel))
+	{
+		return;
+	}
+
+	const float2 UV = (float2(Pixel) + 0.5) / float2(ViewSize);
+	const float3 SceneColor = SceneColorTexture.Load(int3(Pixel, 0)).rgb;
+	const float Noise = Hash12(Pixel);
+	const float3 SamplePosition = float3(UV * 2.0 - 1.0, Noise);
+	const float3 SampleNormal = normalize(float3(UV - 0.5, 1.0));
+	const float Pdf = max(0.05, dot(SampleNormal, float3(0, 0, 1)));
+	const float3 ProxyRadiance = SceneColor * (0.35 + Noise * 0.65);
+
+	InitialReservoir[ReservoirIndex(Pixel)] = MakeReservoir(SamplePosition, SampleNormal, ProxyRadiance, Pdf, 0);
+}
+
+[numthreads(8, 8, 1)]
+void TemporalResamplingCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	const uint2 Pixel = DispatchThreadId.xy;
+	if (!IsInside(Pixel))
+	{
+		return;
+	}
+
+	const uint Index = ReservoirIndex(Pixel);
+	FReSTIRGIPackedReservoir Current = InitialReservoir[Index];
+	if (bHistoryValid != 0)
+	{
+		const FReSTIRGIPackedReservoir History = HistoryReservoir[Index];
+		Current = CombineReservoirs(Current, History, Hash12(Pixel + 17));
+	}
+
+	TemporalReservoir[Index] = Current;
+}
+
+[numthreads(8, 8, 1)]
+void SpatialResamplingCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	const uint2 Pixel = DispatchThreadId.xy;
+	if (!IsInside(Pixel))
+	{
+		return;
+	}
+
+	FReSTIRGIPackedReservoir Current = SourceReservoir[ReservoirIndex(Pixel)];
+	const uint SampleCount = clamp(SpatialSampleCount, 1u, 32u);
+
+	for (uint SampleIndex = 0; SampleIndex < SampleCount; ++SampleIndex)
+	{
+		const float Angle = 6.2831853 * frac(Hash12(Pixel + uint2(SampleIndex, SampleIndex)) + SampleIndex * 0.6180339);
+		const float Radius = SpatialRadius * sqrt(Hash12(Pixel + uint2(SampleIndex, SampleIndex * 13 + 5)));
+		const int2 Offset = int2(round(float2(cos(Angle), sin(Angle)) * Radius));
+		const int2 NeighborInt = clamp(int2(Pixel) + Offset, int2(0, 0), ViewSize - 1);
+		const uint2 Neighbor = uint2(NeighborInt);
+		const FReSTIRGIPackedReservoir Candidate = SourceReservoir[ReservoirIndex(Neighbor)];
+
+		const float NormalSimilarity = dot(Current.SampleNormalAndPdf.xyz, Candidate.SampleNormalAndPdf.xyz);
+		if (NormalSimilarity >= (1.0 - NormalThreshold))
+		{
+			Current = CombineReservoirs(Current, Candidate, Hash12(Pixel + uint2(SampleIndex * 19 + 3, SampleIndex * 7 + 11)));
+		}
+	}
+
+	SpatialReservoir[ReservoirIndex(Pixel)] = Current;
+}
+
+[numthreads(8, 8, 1)]
+void FinalCompositeCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	const uint2 Pixel = DispatchThreadId.xy;
+	if (!IsInside(Pixel))
+	{
+		return;
+	}
+
+	const uint Index = ReservoirIndex(Pixel);
+	const float3 SceneColor = SceneColorTexture.Load(int3(Pixel, 0)).rgb;
+	const FReSTIRGIPackedReservoir R = FinalReservoir[Index];
+	const float3 Indirect = R.RadianceAndM.rgb * R.SamplePositionAndWeight.w * 0.08;
+	const float MisWeight = (bFinalMIS != 0) ? saturate(RoughnessMISClamp + 0.4) : 1.0;
+	const float3 Composite = SceneColor + Indirect * MisWeight;
+
+	float3 OutColor = Composite;
+	if (DebugView == RESTIRGI_DEBUG_RESERVOIR_WEIGHT || DebugView == RESTIRGI_DEBUG_HEATMAP)
+	{
+		OutColor = Heat(R.SamplePositionAndWeight.w);
+	}
+	else if (DebugView == RESTIRGI_DEBUG_SAMPLE_AGE)
+	{
+		OutColor = Heat((float)R.Misc.x / max((float)MaxHistoryLength, 1.0));
+	}
+	else if (DebugView == RESTIRGI_DEBUG_WIPE_COMPARE)
+	{
+		OutColor = ((float)Pixel.x / max((float)ViewSize.x, 1.0) < CompareSplit) ? Composite : SceneColor;
+	}
+	else if (DebugView == RESTIRGI_DEBUG_SIDE_BY_SIDE)
+	{
+		OutColor = (Pixel.x < (uint)(ViewSize.x / 2)) ? Composite : SceneColor;
+	}
+
+	HistoryReservoirOutput[Index] = R;
+	OutputTexture[Pixel] = float4(OutColor, 1.0);
+}
