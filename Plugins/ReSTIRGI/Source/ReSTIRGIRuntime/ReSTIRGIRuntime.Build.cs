@@ -21,5 +21,11 @@ public class ReSTIRGIRuntime : ModuleRules
 		{
 			"ApplicationCore"
 		});
+
+		PrivateIncludePaths.AddRange(new[]
+		{
+			System.IO.Path.Combine(EngineDirectory, "Source/Runtime/Renderer/Private"),
+			System.IO.Path.Combine(EngineDirectory, "Source/Runtime/Renderer/Internal")
+		});
 	}
 }

@@ -28,11 +28,17 @@ private:
 	void PushSettings() const;
 	TSharedRef<SWidget> MakeModeComboWidget(TSharedPtr<FEnumOption> Option) const;
 	TSharedRef<SWidget> MakeDebugComboWidget(TSharedPtr<FEnumOption> Option) const;
+	TSharedRef<SWidget> MakeLumenComboWidget(TSharedPtr<FEnumOption> Option) const;
+	TSharedRef<SWidget> MakeRadianceComboWidget(TSharedPtr<FEnumOption> Option) const;
 	FText GetModeText() const;
 	FText GetDebugText() const;
+	FText GetLumenText() const;
+	FText GetRadianceText() const;
 	FText GetStatsText() const;
 
 	FReSTIRGISettings Settings;
 	TArray<TSharedPtr<FEnumOption>> ModeOptions;
 	TArray<TSharedPtr<FEnumOption>> DebugOptions;
+	TArray<TSharedPtr<FEnumOption>> LumenOptions;
+	TArray<TSharedPtr<FEnumOption>> RadianceOptions;
 };

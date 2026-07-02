@@ -1,25 +1,71 @@
-#include "/Engine/Public/Platform.ush"
+#include "/Engine/Private/Common.ush"
+#include "/Engine/Private/DeferredShadingCommon.ush"
+#include "/Engine/Private/RayTracing/TraceRayInline.ush"
 
-#define RESTIRGI_DEBUG_COMPOSITE 0
-#define RESTIRGI_DEBUG_INITIAL_ONLY 1
-#define RESTIRGI_DEBUG_TEMPORAL 2
-#define RESTIRGI_DEBUG_SPATIAL 3
-#define RESTIRGI_DEBUG_RESERVOIR_WEIGHT 4
-#define RESTIRGI_DEBUG_SAMPLE_AGE 5
-#define RESTIRGI_DEBUG_HEATMAP 6
-#define RESTIRGI_DEBUG_WIPE_COMPARE 7
-#define RESTIRGI_DEBUG_SIDE_BY_SIDE 8
+// --- Debug view constants (must match EReSTIRGIDebugView) ---
+#define DEBUG_COMPOSITE            0
+#define DEBUG_INDIRECT_ONLY        1
+#define DEBUG_INDIRECT_ONLY_LINEAR 2
+#define DEBUG_INDIRECT_ONLY_TM     3
+#define DEBUG_HIT_MASK             4
+#define DEBUG_SURFACE_VALIDITY     5
+#define DEBUG_INITIAL_RESERVOIR    6
+#define DEBUG_TEMPORAL_RESERVOIR   7
+#define DEBUG_SPATIAL_RESERVOIR    8
+#define DEBUG_RESERVOIR_WEIGHT     9
+#define DEBUG_SAMPLE_AGE          10
+#define DEBUG_SELECTED_SAMPLE     11
+#define DEBUG_TARGET_PDF          12
+#define DEBUG_WEIGHT_SUM_M        13
+#define DEBUG_INDIRECT_RAW        14
+
+// --- Lumen compare constants ---
+#define LUMEN_OVERLAY       0
+#define LUMEN_RESTIR_ONLY   1
+#define LUMEN_LUMEN_ONLY    2
+#define LUMEN_WIPE          3
+#define LUMEN_SIDE_BY_SIDE  4
+
+// --- Radiance mode constants ---
+#define RADIANCE_SCREEN_PROJECTED 0
+#define RADIANCE_SYNTHETIC_CONST  1
+#define RADIANCE_NORMAL_COLOR     2
+#define RADIANCE_ALBEDO_COLOR     3
+
+struct FReSTIRGISurface
+{
+	float4 WorldPositionAndDepth;
+	float4 NormalAndRoughness;
+	float4 BaseColorAndSpecular;
+	float4 Misc;
+};
 
 struct FReSTIRGIPackedReservoir
 {
-	float4 SamplePositionAndWeight;
-	float4 SampleNormalAndPdf;
-	float4 RadianceAndM;
-	uint4 Misc;
+	float4 SamplePositionAndWeight; // xyz = position, w = weightSum
+	float4 SampleNormalAndPdf;      // xyz = normal,   w = samplePdf
+	float4 RadianceAndM;            // xyz = radiance, w = M (candidate count)
+	uint4  Misc;                    // x = age, y = valid, z = miss, w = pad
+};
+
+struct FReSTIRGIStats
+{
+	uint4 PrimaryValidAndHitAndInitValid; // x=primaryValid, y=secondaryHit, z=initValid, w=count
+	uint4 TemporalSpatialValidAndCount;   // x=temporalValid, y=spatialValid, z=finalValid, w=count
+	uint4 Pad1;
+	uint4 Pad2;
 };
 
 Texture2D<float4> SceneColorTexture;
 SamplerState SceneColorSampler;
+RaytracingAccelerationStructure TLAS;
+
+RWStructuredBuffer<FReSTIRGISurface> PrimarySurfaceBuffer;
+RWStructuredBuffer<FReSTIRGISurface> SecondarySurfaceBuffer;
+StructuredBuffer<FReSTIRGISurface> HistoryPrimarySurfaceBuffer;
+StructuredBuffer<FReSTIRGISurface> PrimarySurfaceBufferSRV;
+StructuredBuffer<FReSTIRGISurface> SecondarySurfaceBufferSRV;
+RWStructuredBuffer<FReSTIRGISurface> HistoryPrimarySurfaceOutput;
 
 RWStructuredBuffer<FReSTIRGIPackedReservoir> InitialReservoir;
 StructuredBuffer<FReSTIRGIPackedReservoir> HistoryReservoir;
@@ -28,12 +74,18 @@ StructuredBuffer<FReSTIRGIPackedReservoir> FinalReservoir;
 RWStructuredBuffer<FReSTIRGIPackedReservoir> TemporalReservoir;
 RWStructuredBuffer<FReSTIRGIPackedReservoir> SpatialReservoir;
 RWStructuredBuffer<FReSTIRGIPackedReservoir> HistoryReservoirOutput;
+StructuredBuffer<uint> NeighborOffsetBuffer;
 RWTexture2D<float4> OutputTexture;
+RWStructuredBuffer<FReSTIRGIStats> StatsBuffer;
 
-int2 ViewSize;
+int2 ViewRectMin;
+int2 ViewRectSize;
+int2 BufferSize;
+int2 ReservoirSize;
 uint FrameIndex;
 uint ResamplingMode;
 uint DebugView;
+uint RadianceMode;
 uint SpatialSampleCount;
 uint MaxHistoryLength;
 float SpatialRadius;
@@ -41,20 +93,59 @@ float NormalThreshold;
 float DepthThreshold;
 float RoughnessMISClamp;
 float RadianceClamp;
+float GIIntensity;
 float CompareSplit;
+float MaxRayDistance;
+float NormalBias;
+float DiffuseRayProbability;
+float SecondaryRoughnessClamp;
+float BoilingFilterStrength;
+float SyntheticConstantIntensity;
 uint bFinalMIS;
 uint bFinalVisibility;
 uint bHistoryValid;
+uint bRayTracingAvailable;
+uint bConservativeVisibility;
+uint LumenCompareMode;
+
+// ============================================================================
+// Coordinate helpers — all GBuffer/SceneColor/Output use buffer-space coords
+// ============================================================================
+
+// Convert a reservoir-space dispatch pixel to a buffer-space view pixel
+uint2 ReservoirPixelToBufferPixel(uint2 ReservoirPixel)
+{
+	const float2 Scale = float2(ViewRectSize) / max(float2(ReservoirSize), 1.0);
+	return min((uint2)floor(float2(ReservoirPixel) * Scale) + (uint2)ViewRectMin, (uint2)(BufferSize - 1));
+}
+
+// Convert a buffer-space pixel to a reservoir-space pixel
+uint2 BufferPixelToReservoirPixel(uint2 BufferPixel)
+{
+	const int2 ViewPixel = int2(BufferPixel) - ViewRectMin;
+	const float2 Scale = float2(ReservoirSize) / max(float2(ViewRectSize), 1.0);
+	return min((uint2)floor(float2(ViewPixel) * Scale), (uint2)(ReservoirSize - 1));
+}
 
 uint ReservoirIndex(uint2 Pixel)
 {
-	return Pixel.y * ViewSize.x + Pixel.x;
+	return Pixel.y * ReservoirSize.x + Pixel.x;
 }
 
-bool IsInside(uint2 Pixel)
+bool IsInsideReservoir(uint2 Pixel)
 {
-	return Pixel.x < (uint)ViewSize.x && Pixel.y < (uint)ViewSize.y;
+	return Pixel.x < (uint)ReservoirSize.x && Pixel.y < (uint)ReservoirSize.y;
 }
+
+bool IsInsideView(uint2 BufferPixel)
+{
+	const int2 ViewPixel = int2(BufferPixel) - ViewRectMin;
+	return ViewPixel.x >= 0 && ViewPixel.y >= 0 && ViewPixel.x < ViewRectSize.x && ViewPixel.y < ViewRectSize.y;
+}
+
+// ============================================================================
+// Hashing
+// ============================================================================
 
 float Hash12(uint2 P)
 {
@@ -65,44 +156,19 @@ float Hash12(uint2 P)
 	return (State & 0x00ffffffu) / 16777215.0f;
 }
 
-FReSTIRGIPackedReservoir EmptyReservoir()
+float2 Hash22(uint2 P)
 {
-	FReSTIRGIPackedReservoir R;
-	R.SamplePositionAndWeight = 0;
-	R.SampleNormalAndPdf = float4(0, 0, 1, 1);
-	R.RadianceAndM = 0;
-	R.Misc = 0;
-	return R;
+	return float2(Hash12(P), Hash12(P.yx + 37u));
 }
 
-FReSTIRGIPackedReservoir MakeReservoir(float3 SamplePosition, float3 SampleNormal, float3 Radiance, float Pdf, uint Age)
-{
-	FReSTIRGIPackedReservoir R;
-	const float SafePdf = max(Pdf, 1e-4);
-	const float Luma = dot(Radiance, float3(0.2126, 0.7152, 0.0722));
-	const float Weight = saturate(Luma / SafePdf);
-	R.SamplePositionAndWeight = float4(SamplePosition, Weight);
-	R.SampleNormalAndPdf = float4(normalize(SampleNormal), SafePdf);
-	R.RadianceAndM = float4(min(Radiance, (float3)RadianceClamp), 1.0);
-	R.Misc = uint4(Age, 0, 0, 0);
-	return R;
-}
+// ============================================================================
+// Math helpers
+// ============================================================================
 
-FReSTIRGIPackedReservoir CombineReservoirs(FReSTIRGIPackedReservoir A, FReSTIRGIPackedReservoir B, float RandomValue)
+float3 SafeNormalize(float3 V, float3 Fallback)
 {
-	const float WeightA = max(A.SamplePositionAndWeight.w, 0.0);
-	const float WeightB = max(B.SamplePositionAndWeight.w, 0.0);
-	const float Sum = WeightA + WeightB;
-	if (Sum <= 1e-5)
-	{
-		return A;
-	}
-
-	FReSTIRGIPackedReservoir OutR = (RandomValue < WeightB / Sum) ? B : A;
-	OutR.SamplePositionAndWeight.w = Sum * 0.5;
-	OutR.RadianceAndM.w = max(1.0, A.RadianceAndM.w + B.RadianceAndM.w);
-	OutR.Misc.x = min(MaxHistoryLength, max(A.Misc.x, B.Misc.x) + 1);
-	return OutR;
+	const float Len2 = dot(V, V);
+	return Len2 > 1e-8 ? V * rsqrt(Len2) : Fallback;
 }
 
 float3 Heat(float X)
@@ -111,111 +177,694 @@ float3 Heat(float X)
 	return saturate(float3(1.5 * X, 1.5 - abs(X - 0.5) * 3.0, 1.5 * (1.0 - X)));
 }
 
-[numthreads(8, 8, 1)]
-void InitialSampleCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+float3 DebugToneMap(float3 Color)
 {
-	const uint2 Pixel = DispatchThreadId.xy;
-	if (!IsInside(Pixel))
-	{
-		return;
-	}
-
-	const float2 UV = (float2(Pixel) + 0.5) / float2(ViewSize);
-	const float3 SceneColor = SceneColorTexture.Load(int3(Pixel, 0)).rgb;
-	const float Noise = Hash12(Pixel);
-	const float3 SamplePosition = float3(UV * 2.0 - 1.0, Noise);
-	const float3 SampleNormal = normalize(float3(UV - 0.5, 1.0));
-	const float Pdf = max(0.05, dot(SampleNormal, float3(0, 0, 1)));
-	const float3 ProxyRadiance = SceneColor * (0.35 + Noise * 0.65);
-
-	InitialReservoir[ReservoirIndex(Pixel)] = MakeReservoir(SamplePosition, SampleNormal, ProxyRadiance, Pdf, 0);
+	Color = max(Color, 0.0);
+	return Color / (1.0 + Color);
 }
 
-[numthreads(8, 8, 1)]
-void TemporalResamplingCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+float3x3 MakeTangentBasis(float3 N)
 {
-	const uint2 Pixel = DispatchThreadId.xy;
-	if (!IsInside(Pixel))
-	{
-		return;
-	}
-
-	const uint Index = ReservoirIndex(Pixel);
-	FReSTIRGIPackedReservoir Current = InitialReservoir[Index];
-	if (bHistoryValid != 0)
-	{
-		const FReSTIRGIPackedReservoir History = HistoryReservoir[Index];
-		Current = CombineReservoirs(Current, History, Hash12(Pixel + 17));
-	}
-
-	TemporalReservoir[Index] = Current;
+	const float3 Up = abs(N.z) < 0.999 ? float3(0, 0, 1) : float3(1, 0, 0);
+	const float3 T = normalize(cross(Up, N));
+	const float3 B = cross(N, T);
+	return float3x3(T, B, N);
 }
 
-[numthreads(8, 8, 1)]
-void SpatialResamplingCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+float3 CosineHemisphere(float2 Xi, float3 N, out float Pdf)
 {
-	const uint2 Pixel = DispatchThreadId.xy;
-	if (!IsInside(Pixel))
+	const float R = sqrt(Xi.x);
+	const float Phi = 6.28318530718 * Xi.y;
+	const float3 Local = float3(R * cos(Phi), R * sin(Phi), sqrt(saturate(1.0 - Xi.x)));
+	Pdf = max(Local.z * 0.31830988618, 1e-4);
+	return mul(Local, MakeTangentBasis(N));
+}
+
+float3 SampleSecondaryDirection(FReSTIRGISurface Primary, uint2 Pixel, out float RayPdf)
+{
+	const float3 N = Primary.NormalAndRoughness.xyz;
+	const float2 DiffuseXi = Hash22(Pixel + FrameIndex);
+	float DiffusePdf = 1.0;
+	const float3 DiffuseDirection = CosineHemisphere(DiffuseXi, N, DiffusePdf);
+
+	if (Hash12(Pixel + 91u) < DiffuseRayProbability)
 	{
-		return;
+		RayPdf = max(DiffusePdf, 1e-4);
+		return DiffuseDirection;
 	}
 
-	FReSTIRGIPackedReservoir Current = SourceReservoir[ReservoirIndex(Pixel)];
-	const uint SampleCount = clamp(SpatialSampleCount, 1u, 32u);
+	const float3 ViewDirection = SafeNormalize(-Primary.WorldPositionAndDepth.xyz, N);
+	const float3 ReflectionDirection = SafeNormalize(reflect(-ViewDirection, N), N);
+	float GlossyPdf = 1.0;
+	const float3 GlossyJitter = CosineHemisphere(Hash22(Pixel + 123u), ReflectionDirection, GlossyPdf);
+	const float GlossyBlend = saturate(Primary.NormalAndRoughness.w);
+	const float3 GlossyDirection = SafeNormalize(lerp(ReflectionDirection, GlossyJitter, GlossyBlend), DiffuseDirection);
 
-	for (uint SampleIndex = 0; SampleIndex < SampleCount; ++SampleIndex)
+	if (dot(GlossyDirection, N) <= 0.0)
 	{
-		const float Angle = 6.2831853 * frac(Hash12(Pixel + uint2(SampleIndex, SampleIndex)) + SampleIndex * 0.6180339);
-		const float Radius = SpatialRadius * sqrt(Hash12(Pixel + uint2(SampleIndex, SampleIndex * 13 + 5)));
-		const int2 Offset = int2(round(float2(cos(Angle), sin(Angle)) * Radius));
-		const int2 NeighborInt = clamp(int2(Pixel) + Offset, int2(0, 0), ViewSize - 1);
-		const uint2 Neighbor = uint2(NeighborInt);
-		const FReSTIRGIPackedReservoir Candidate = SourceReservoir[ReservoirIndex(Neighbor)];
+		RayPdf = max(DiffusePdf, 1e-4);
+		return DiffuseDirection;
+	}
 
-		const float NormalSimilarity = dot(Current.SampleNormalAndPdf.xyz, Candidate.SampleNormalAndPdf.xyz);
-		if (NormalSimilarity >= (1.0 - NormalThreshold))
+	RayPdf = max(GlossyPdf, 1e-4);
+	return GlossyDirection;
+}
+
+// ============================================================================
+// Surface / Reservoir factories
+// ============================================================================
+
+FReSTIRGISurface EmptySurface()
+{
+	FReSTIRGISurface S;
+	S.WorldPositionAndDepth = 0;
+	S.NormalAndRoughness = float4(0, 0, 1, 1);
+	S.BaseColorAndSpecular = float4(1, 1, 1, 0.5);
+	S.Misc = 0;
+	return S;
+}
+
+FReSTIRGIPackedReservoir EmptyReservoir()
+{
+	FReSTIRGIPackedReservoir R;
+	R.SamplePositionAndWeight = 0;
+	R.SampleNormalAndPdf = float4(0, 0, 1, 0);
+	R.RadianceAndM = 0;
+	R.Misc = uint4(0, 0, 0, 0);
+	return R;
+}
+
+// ============================================================================
+// Target PDF — the importance function for GI reservoirs.
+// Uses Lambertian geometry term: cos(primary) * cos(secondary) / dist^2
+// ============================================================================
+
+float TargetPdf(FReSTIRGISurface Surface, float3 SamplePosition, float3 SampleNormal)
+{
+	const float3 ToSample = SamplePosition - Surface.WorldPositionAndDepth.xyz;
+	const float Dist2 = max(dot(ToSample, ToSample), 1e-4);
+	const float3 L = ToSample * rsqrt(Dist2);
+	const float NoL = saturate(dot(Surface.NormalAndRoughness.xyz, L));
+	const float SampleNoL = saturate(dot(SampleNormal, -L));
+	return max(NoL * SampleNoL / Dist2, 0.0);
+}
+
+// ============================================================================
+// Reservoir creation and combination — follows RTXDI GI semantics.
+//
+// Stored fields:
+//   SamplePositionAndWeight.w = weightSum  (= Σ p_target / p_source)
+//   SampleNormalAndPdf.w      = samplePdf  (p_source of selected sample)
+//   RadianceAndM.w            = M          (candidate count)
+//   Misc.x                    = age
+//   Misc.y                    = valid flag
+//   Misc.z                    = miss flag
+//
+// Initial: weightSum = p_target / p_source, M = 1
+// Combine: weightSum = A.w + B.w, M = A.M + B.M, pick by w proportion
+// Final:   L = BRDF * radiance * p_hat(X) * (weightSum / M)
+// ============================================================================
+
+FReSTIRGIPackedReservoir MakeReservoir(float3 SamplePosition, float3 SampleNormal, float3 Radiance, float SamplePdf, float3 PrimaryPos, float3 PrimaryNormal)
+{
+	FReSTIRGIPackedReservoir R;
+	const float SafePdf = max(SamplePdf, 1e-6);
+
+	// Compute targetPdf inline using primary position and normal
+	const float3 ToSample = SamplePosition - PrimaryPos;
+	const float Dist2 = max(dot(ToSample, ToSample), 1e-4);
+	const float3 L = ToSample * rsqrt(Dist2);
+	const float NoL = saturate(dot(PrimaryNormal, L));
+	const float SampleNoL = saturate(dot(SampleNormal, -L));
+	const float TPdf = max(NoL * SampleNoL / Dist2, 0.0);
+
+	const float Weight = TPdf / SafePdf;
+
+	R.SamplePositionAndWeight = float4(SamplePosition, Weight);
+	R.SampleNormalAndPdf = float4(SafeNormalize(SampleNormal, float3(0, 0, 1)), SafePdf);
+	R.RadianceAndM = float4(min(max(Radiance, 0.0), (float3)RadianceClamp), 1.0);
+	R.Misc = uint4(0, 1, 0, 0);
+	return R;
+}
+
+float ReservoirTargetPdf(FReSTIRGIPackedReservoir R, FReSTIRGISurface Surface)
+{
+	return TargetPdf(Surface, R.SamplePositionAndWeight.xyz, R.SampleNormalAndPdf.xyz);
+}
+
+bool IsValidReservoir(FReSTIRGIPackedReservoir R)
+{
+	return R.Misc.y != 0 && R.RadianceAndM.w > 0.0;
+}
+
+FReSTIRGIPackedReservoir CombineReservoirs(FReSTIRGIPackedReservoir A, FReSTIRGIPackedReservoir B, float RandomValue, FReSTIRGISurface Surface)
+{
+	if (!IsValidReservoir(B))
+		return A;
+	if (!IsValidReservoir(A))
+		return B;
+
+	const float WeightA = max(A.SamplePositionAndWeight.w, 0.0);
+	const float WeightB = max(B.SamplePositionAndWeight.w, 0.0);
+	const float Sum = WeightA + WeightB;
+
+	if (Sum <= 1e-8)
+		return A;
+
+	FReSTIRGIPackedReservoir OutR = A;
+	if (RandomValue < WeightB / Sum)
+	{
+		OutR.SamplePositionAndWeight.xyz = B.SamplePositionAndWeight.xyz;
+		OutR.SampleNormalAndPdf = B.SampleNormalAndPdf;
+		OutR.RadianceAndM.rgb = B.RadianceAndM.rgb;
+		OutR.Misc.z = B.Misc.z;
+	}
+
+	// Accumulate weightSum and M
+	OutR.SamplePositionAndWeight.w = Sum;
+	OutR.RadianceAndM.w = A.RadianceAndM.w + B.RadianceAndM.w;
+	// Age = max of both + 1 (temporal), or just max for spatial
+	OutR.Misc.x = min(MaxHistoryLength, max(A.Misc.x, B.Misc.x) + 1);
+	OutR.Misc.y = 1;
+
+	return OutR;
+}
+
+// ============================================================================
+// Primary surface loading — uses buffer-space coordinates
+// ============================================================================
+
+FReSTIRGISurface LoadPrimarySurface(uint2 ReservoirPixel)
+{
+	const uint2 BufferPixel = ReservoirPixelToBufferPixel(ReservoirPixel);
+	const float DeviceZ = SceneTexturesStruct.SceneDepthTexture.Load(int3(BufferPixel, 0)).r;
+	const float SceneDepth = ConvertFromDeviceZ(DeviceZ);
+	const FGBufferData GBuffer = GetGBufferDataUint(BufferPixel);
+	const float3 TranslatedWorld = SvPositionToTranslatedWorld(float4(float2(BufferPixel) + 0.5, DeviceZ, 1.0));
+
+	FReSTIRGISurface Surface;
+	Surface.WorldPositionAndDepth = float4(TranslatedWorld, SceneDepth);
+	Surface.NormalAndRoughness = float4(SafeNormalize(GBuffer.WorldNormal, float3(0, 0, 1)), saturate(max(GBuffer.Roughness, SecondaryRoughnessClamp)));
+	Surface.BaseColorAndSpecular = float4(saturate(GBuffer.BaseColor), saturate(GBuffer.Specular));
+	Surface.Misc = float4((DeviceZ > 0.0 && DeviceZ < 1.0) ? 1.0 : 0.0, 0, 0, 0);
+	return Surface;
+}
+
+// ============================================================================
+// Secondary radiance — multiple modes for verification
+// ============================================================================
+
+float2 TranslatedWorldToBufferUV(float3 TranslatedWorld)
+{
+	const float4 Clip = mul(float4(TranslatedWorld, 1.0), View.TranslatedWorldToClip);
+	return ScreenPositionToBufferUV(Clip);
+}
+
+float3 GetSecondaryRadiance(float3 HitPosition, float3 HitNormal, float3 RayDirection, FReSTIRGISurface Primary, bool bHit)
+{
+	if (RadianceMode == RADIANCE_SYNTHETIC_CONST)
+	{
+		// Constant orange-ish radiance to prove the algorithm pipeline works
+		return float3(1.0, 0.6, 0.2) * SyntheticConstantIntensity;
+	}
+
+	if (RadianceMode == RADIANCE_NORMAL_COLOR)
+	{
+		// Encode hit normal as color — direction-dependent, no scene dependence
+		if (bHit)
+			return HitNormal * 0.5 + 0.5;
+		return float3(0.0, 0.0, 0.0);
+	}
+
+	if (RadianceMode == RADIANCE_ALBEDO_COLOR)
+	{
+		// Use primary albedo as radiance — proves reservoir stores and replays radiance
+		if (bHit)
+			return Primary.BaseColorAndSpecular.rgb;
+		return float3(0.0, 0.0, 0.0);
+	}
+
+	// RADIANCE_SCREEN_PROJECTED: sample SceneColor at hit position
+	if (bHit)
+	{
+		const float2 UV = TranslatedWorldToBufferUV(HitPosition);
+		if (all(UV >= 0.0) && all(UV <= 1.0))
 		{
-			Current = CombineReservoirs(Current, Candidate, Hash12(Pixel + uint2(SampleIndex * 19 + 3, SampleIndex * 7 + 11)));
+			return SceneColorTexture.SampleLevel(SceneColorSampler, UV, 0).rgb;
 		}
 	}
 
-	SpatialReservoir[ReservoirIndex(Pixel)] = Current;
+	// Sky fallback
+	const float Sky = saturate(RayDirection.z * 0.5 + 0.5);
+	return lerp(float3(0.015, 0.018, 0.025), float3(0.24, 0.32, 0.48), Sky);
 }
 
+bool TraceSecondarySurface(FReSTIRGISurface Primary, float3 RayDirection, out FReSTIRGISurface Secondary)
+{
+	Secondary = EmptySurface();
+
+	RayDesc Ray;
+	Ray.Origin = Primary.WorldPositionAndDepth.xyz + Primary.NormalAndRoughness.xyz * NormalBias;
+	Ray.Direction = SafeNormalize(RayDirection, Primary.NormalAndRoughness.xyz);
+	Ray.TMin = 0.0;
+	Ray.TMax = MaxRayDistance;
+
+	FTraceRayInlineContext TraceContext = CreateTraceRayInlineContext();
+	FTraceRayInlineResult TraceResult = TraceRayInline(TLAS, RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH, 0xff, Ray, TraceContext);
+	const bool bHit = TraceResult.HitT > 0.0;
+
+	const float HitT = bHit ? TraceResult.HitT : MaxRayDistance;
+	const float3 HitPosition = Ray.Origin + Ray.Direction * HitT;
+	const float3 HitNormal = bHit ? SafeNormalize(TraceResult.WorldGeometryNormal, -Ray.Direction) : -Ray.Direction;
+	const float3 Radiance = GetSecondaryRadiance(HitPosition, HitNormal, Ray.Direction, Primary, bHit);
+
+	Secondary.WorldPositionAndDepth = float4(HitPosition, HitT);
+	Secondary.NormalAndRoughness = float4(HitNormal, 1.0);
+	Secondary.BaseColorAndSpecular = float4(Radiance, bHit ? 1.0 : 0.0);
+	Secondary.Misc = float4(bHit ? 1.0 : 0.0, 0, 0, 0);
+	return bHit;
+}
+
+float3 EvaluateDiffuseBrdf(FReSTIRGISurface Surface, float3 L)
+{
+	const float NoL = saturate(dot(Surface.NormalAndRoughness.xyz, L));
+	return Surface.BaseColorAndSpecular.rgb * NoL * 0.31830988618;
+}
+
+bool VisibilityRay(FReSTIRGISurface Primary, float3 SamplePosition)
+{
+	const float3 ToSample = SamplePosition - Primary.WorldPositionAndDepth.xyz;
+	const float Distance = length(ToSample);
+	if (Distance <= 1e-3)
+		return false;
+
+	RayDesc Ray;
+	Ray.Origin = Primary.WorldPositionAndDepth.xyz + Primary.NormalAndRoughness.xyz * NormalBias;
+	Ray.Direction = ToSample / Distance;
+	Ray.TMin = 0.0;
+	Ray.TMax = max(Distance - NormalBias * 2.0, 0.001);
+
+	FTraceRayInlineContext TraceContext = CreateTraceRayInlineContext();
+	FTraceRayInlineResult TraceResult = TraceRayInline(TLAS, RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH, 0xff, Ray, TraceContext);
+	return TraceResult.HitT <= 0.0;
+}
+
+int2 DecodeOffset(uint Encoded)
+{
+	const int X = (int)(Encoded & 0xffffu);
+	const int Y = (int)((Encoded >> 16) & 0xffffu);
+	return int2((X >= 32768) ? X - 65536 : X, (Y >= 32768) ? Y - 65536 : Y);
+}
+
+// ============================================================================
+// Stats accumulation helpers — uint atomics only
+// ============================================================================
+
+groupshared uint GS_StatPrimaryValid;
+groupshared uint GS_StatSecondaryHit;
+groupshared uint GS_StatValid;
+groupshared uint GS_StatCount;
+
+void ResetGroupStats(uint LocalIndex)
+{
+	if (LocalIndex == 0)
+	{
+		GS_StatPrimaryValid = 0;
+		GS_StatSecondaryHit = 0;
+		GS_StatValid = 0;
+		GS_StatCount = 0;
+	}
+	GroupMemoryBarrierWithGroupSync();
+}
+
+void FinalizeGroupStats(uint LocalIndex, uint StatSlot)
+{
+	GroupMemoryBarrierWithGroupSync();
+	if (LocalIndex == 0)
+	{
+		InterlockedAdd(StatsBuffer[StatSlot].PrimaryValidAndHitAndInitValid.x, GS_StatPrimaryValid);
+		InterlockedAdd(StatsBuffer[StatSlot].PrimaryValidAndHitAndInitValid.y, GS_StatSecondaryHit);
+		InterlockedAdd(StatsBuffer[StatSlot].PrimaryValidAndHitAndInitValid.z, GS_StatValid);
+		InterlockedAdd(StatsBuffer[StatSlot].PrimaryValidAndHitAndInitValid.w, GS_StatCount);
+	}
+}
+
+// ============================================================================
+// Initial Sample CS
+// ============================================================================
+
 [numthreads(8, 8, 1)]
-void FinalCompositeCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+void InitialSampleCS(uint3 DispatchThreadId : SV_DispatchThreadID, uint3 GroupId : SV_GroupID, uint LocalIndex : SV_GroupIndex)
 {
 	const uint2 Pixel = DispatchThreadId.xy;
-	if (!IsInside(Pixel))
+	ResetGroupStats(LocalIndex);
+
+	bool bValidPixel = false;
+	bool bPrimaryValid = false;
+	bool bSecondaryHit = false;
+	bool bInitValid = false;
+
+	if (IsInsideReservoir(Pixel))
 	{
-		return;
+		bValidPixel = true;
+		const uint Index = ReservoirIndex(Pixel);
+		FReSTIRGISurface Primary = LoadPrimarySurface(Pixel);
+		PrimarySurfaceBuffer[Index] = Primary;
+
+		if (Primary.Misc.x > 0.0 && bRayTracingAvailable != 0)
+		{
+			bPrimaryValid = true;
+			float RayPdf = 1.0;
+			const float3 RayDirection = SampleSecondaryDirection(Primary, Pixel, RayPdf);
+
+			FReSTIRGISurface Secondary;
+			const bool bHit = TraceSecondarySurface(Primary, RayDirection, Secondary);
+			SecondarySurfaceBuffer[Index] = Secondary;
+
+			if (bHit)
+			{
+				bSecondaryHit = true;
+				bInitValid = true;
+				const float3 PrimaryPos = Primary.WorldPositionAndDepth.xyz;
+				const float3 PrimaryNormal = Primary.NormalAndRoughness.xyz;
+				InitialReservoir[Index] = MakeReservoir(
+					Secondary.WorldPositionAndDepth.xyz,
+					Secondary.NormalAndRoughness.xyz,
+					Secondary.BaseColorAndSpecular.rgb,
+					RayPdf,
+					PrimaryPos,
+					PrimaryNormal);
+			}
+			else
+			{
+				const float3 PrimaryPos = Primary.WorldPositionAndDepth.xyz;
+				const float3 PrimaryNormal = Primary.NormalAndRoughness.xyz;
+				FReSTIRGIPackedReservoir R = MakeReservoir(
+					PrimaryPos + RayDirection * MaxRayDistance,
+					-RayDirection,
+					Secondary.BaseColorAndSpecular.rgb,
+					RayPdf,
+					PrimaryPos,
+					PrimaryNormal);
+				R.Misc.z = 1;
+				InitialReservoir[Index] = R;
+			}
+		}
+		else
+		{
+			SecondarySurfaceBuffer[Index] = EmptySurface();
+			InitialReservoir[Index] = EmptyReservoir();
+		}
 	}
 
-	const uint Index = ReservoirIndex(Pixel);
-	const float3 SceneColor = SceneColorTexture.Load(int3(Pixel, 0)).rgb;
-	const FReSTIRGIPackedReservoir R = FinalReservoir[Index];
-	const float3 Indirect = R.RadianceAndM.rgb * R.SamplePositionAndWeight.w * 0.08;
-	const float MisWeight = (bFinalMIS != 0) ? saturate(RoughnessMISClamp + 0.4) : 1.0;
-	const float3 Composite = SceneColor + Indirect * MisWeight;
-
-	float3 OutColor = Composite;
-	if (DebugView == RESTIRGI_DEBUG_RESERVOIR_WEIGHT || DebugView == RESTIRGI_DEBUG_HEATMAP)
+	if (bValidPixel)
 	{
-		OutColor = Heat(R.SamplePositionAndWeight.w);
-	}
-	else if (DebugView == RESTIRGI_DEBUG_SAMPLE_AGE)
-	{
-		OutColor = Heat((float)R.Misc.x / max((float)MaxHistoryLength, 1.0));
-	}
-	else if (DebugView == RESTIRGI_DEBUG_WIPE_COMPARE)
-	{
-		OutColor = ((float)Pixel.x / max((float)ViewSize.x, 1.0) < CompareSplit) ? Composite : SceneColor;
-	}
-	else if (DebugView == RESTIRGI_DEBUG_SIDE_BY_SIDE)
-	{
-		OutColor = (Pixel.x < (uint)(ViewSize.x / 2)) ? Composite : SceneColor;
+		InterlockedAdd(GS_StatPrimaryValid, bPrimaryValid ? 1 : 0);
+		InterlockedAdd(GS_StatSecondaryHit, bSecondaryHit ? 1 : 0);
+		InterlockedAdd(GS_StatValid, bInitValid ? 1 : 0);
+		InterlockedAdd(GS_StatCount, 1);
 	}
 
-	HistoryReservoirOutput[Index] = R;
-	OutputTexture[Pixel] = float4(OutColor, 1.0);
+	FinalizeGroupStats(LocalIndex, 0);
+}
+
+// ============================================================================
+// Temporal Resampling CS — with velocity reprojection
+// ============================================================================
+
+[numthreads(8, 8, 1)]
+void TemporalResamplingCS(uint3 DispatchThreadId : SV_DispatchThreadID, uint3 GroupId : SV_GroupID, uint LocalIndex : SV_GroupIndex)
+{
+	const uint2 Pixel = DispatchThreadId.xy;
+	ResetGroupStats(LocalIndex);
+
+	bool bValidPixel = false;
+	bool bTemporalValid = false;
+
+	if (IsInsideReservoir(Pixel))
+	{
+		bValidPixel = true;
+		const uint Index = ReservoirIndex(Pixel);
+		const FReSTIRGISurface Primary = PrimarySurfaceBufferSRV[Index];
+		FReSTIRGIPackedReservoir Current = InitialReservoir[Index];
+
+		if (bHistoryValid != 0 && Primary.Misc.x > 0.0)
+		{
+			// Velocity reprojection: use View.PrevTranslatedWorldToClip to find history pixel
+			const float3 PrimaryWorld = Primary.WorldPositionAndDepth.xyz;
+			const float4 PrevClip = mul(float4(PrimaryWorld, 1.0), View.PrevTranslatedWorldToClip);
+			const float3 PrevScreen = PrevClip.xyz / max(PrevClip.w, 1e-4);
+			float2 PrevUV = PrevScreen.xy * float2(0.5, -0.5) + 0.5;
+
+			float2 PrevReservoirUV = PrevUV * float2(ReservoirSize);
+			int2 HistoryPixel = int2(floor(PrevReservoirUV));
+
+			if (all(HistoryPixel >= 0) && all(HistoryPixel < ReservoirSize))
+			{
+				const uint HistoryIndex = ReservoirIndex((uint2)HistoryPixel);
+				const FReSTIRGISurface HistorySurface = HistoryPrimarySurfaceBuffer[HistoryIndex];
+				const bool bDepthMatch = abs(Primary.WorldPositionAndDepth.w - HistorySurface.WorldPositionAndDepth.w) <= max(DepthThreshold * max(Primary.WorldPositionAndDepth.w, 1.0), 1.0);
+				const bool bNormalMatch = dot(Primary.NormalAndRoughness.xyz, HistorySurface.NormalAndRoughness.xyz) >= (1.0 - NormalThreshold);
+				const FReSTIRGIPackedReservoir History = HistoryReservoir[HistoryIndex];
+
+				if (bDepthMatch && bNormalMatch && IsValidReservoir(History) && History.Misc.x < MaxHistoryLength)
+				{
+					Current = CombineReservoirs(Current, History, Hash12(Pixel + 17u), Primary);
+					bTemporalValid = IsValidReservoir(Current);
+				}
+			}
+		}
+
+		TemporalReservoir[Index] = Current;
+	}
+
+	if (bValidPixel)
+	{
+		InterlockedAdd(GS_StatValid, bTemporalValid ? 1 : 0);
+		InterlockedAdd(GS_StatCount, 1);
+	}
+
+	FinalizeGroupStats(LocalIndex, 1);
+}
+
+// ============================================================================
+// Spatial Resampling CS — recompute targetPdf for neighbor candidates
+// ============================================================================
+
+[numthreads(8, 8, 1)]
+void SpatialResamplingCS(uint3 DispatchThreadId : SV_DispatchThreadID, uint3 GroupId : SV_GroupID, uint LocalIndex : SV_GroupIndex)
+{
+	const uint2 Pixel = DispatchThreadId.xy;
+	ResetGroupStats(LocalIndex);
+
+	bool bValidPixel = false;
+	bool bSpatialValid = false;
+
+	if (IsInsideReservoir(Pixel))
+	{
+		bValidPixel = true;
+		const uint Index = ReservoirIndex(Pixel);
+		const FReSTIRGISurface Primary = PrimarySurfaceBufferSRV[Index];
+		FReSTIRGIPackedReservoir Current = SourceReservoir[Index];
+		const uint SampleCount = clamp(SpatialSampleCount, 1u, 32u);
+
+		for (uint SampleIndex = 0; SampleIndex < SampleCount; ++SampleIndex)
+		{
+			const uint OffsetIndex = (SampleIndex * 13u + (Pixel.x + Pixel.y * 7u + FrameIndex)) & 63u;
+			const float RadiusScale = max(1.0, SpatialRadius / 4.0);
+			const int2 BaseOffset = DecodeOffset(NeighborOffsetBuffer[OffsetIndex]);
+			const int2 Jitter = int2(round((Hash22(Pixel + SampleIndex * 19u) * 2.0 - 1.0) * RadiusScale));
+			const int2 NeighborInt = clamp(int2(Pixel) + int2(round(float2(BaseOffset) * RadiusScale)) + Jitter, int2(0, 0), ReservoirSize - 1);
+			const uint2 Neighbor = (uint2)NeighborInt;
+			const uint NeighborIndex = ReservoirIndex(Neighbor);
+
+			const FReSTIRGISurface NeighborSurface = PrimarySurfaceBufferSRV[NeighborIndex];
+			const FReSTIRGIPackedReservoir Candidate = SourceReservoir[NeighborIndex];
+
+			if (!IsValidReservoir(Candidate))
+				continue;
+
+			const bool bDepthMatch = abs(Primary.WorldPositionAndDepth.w - NeighborSurface.WorldPositionAndDepth.w) <= max(DepthThreshold * max(Primary.WorldPositionAndDepth.w, 1.0), 1.0);
+			const bool bNormalMatch = dot(Primary.NormalAndRoughness.xyz, NeighborSurface.NormalAndRoughness.xyz) >= (1.0 - NormalThreshold);
+
+			if (!bDepthMatch || !bNormalMatch)
+				continue;
+
+			const float CandidateTPdf = ReservoirTargetPdf(Candidate, Primary);
+			if (CandidateTPdf <= 1e-8)
+				continue;
+
+			Current = CombineReservoirs(Current, Candidate, Hash12(Pixel + uint2(SampleIndex * 23u + 3u, SampleIndex * 11u + 5u)), Primary);
+		}
+
+		if (BoilingFilterStrength > 0.0)
+		{
+			const float MaxWeight = lerp(64.0, 8.0, BoilingFilterStrength);
+			Current.SamplePositionAndWeight.w = min(Current.SamplePositionAndWeight.w, MaxWeight);
+		}
+
+		SpatialReservoir[Index] = Current;
+		bSpatialValid = IsValidReservoir(Current);
+	}
+
+	if (bValidPixel)
+	{
+		InterlockedAdd(GS_StatValid, bSpatialValid ? 1 : 0);
+		InterlockedAdd(GS_StatCount, 1);
+	}
+
+	FinalizeGroupStats(LocalIndex, 2);
+}
+
+// ============================================================================
+// Final Composite CS
+// ============================================================================
+
+[numthreads(8, 8, 1)]
+void FinalCompositeCS(uint3 DispatchThreadId : SV_DispatchThreadID, uint3 GroupId : SV_GroupID, uint LocalIndex : SV_GroupIndex)
+{
+	const uint2 DispatchPixel = DispatchThreadId.xy;
+	ResetGroupStats(LocalIndex);
+
+	bool bValidPixel = false;
+	bool bFinalValid = false;
+
+	const uint2 BufferPixel = min(DispatchPixel + (uint2)ViewRectMin, (uint2)(BufferSize - 1));
+
+	if (IsInsideView(BufferPixel))
+	{
+		bValidPixel = true;
+		const uint2 ReservoirPixel = BufferPixelToReservoirPixel(BufferPixel);
+		const uint Index = ReservoirIndex(ReservoirPixel);
+		const float3 SceneColor = SceneColorTexture.Load(int3(BufferPixel, 0)).rgb;
+		const FReSTIRGISurface Primary = PrimarySurfaceBufferSRV[Index];
+		const FReSTIRGIPackedReservoir R = FinalReservoir[Index];
+
+		float3 Indirect = 0.0;
+		float ReservoirWeight = 0.0;
+
+		if (Primary.Misc.x > 0.0 && IsValidReservoir(R))
+		{
+			bFinalValid = true;
+			const float3 ToSample = R.SamplePositionAndWeight.xyz - Primary.WorldPositionAndDepth.xyz;
+			const float3 L = SafeNormalize(ToSample, Primary.NormalAndRoughness.xyz);
+			const bool bVisible = (bFinalVisibility == 0 && bConservativeVisibility == 0) || VisibilityRay(Primary, R.SamplePositionAndWeight.xyz);
+			const float MisWeight = (bFinalMIS != 0) ? saturate((Primary.NormalAndRoughness.w - RoughnessMISClamp) / max(1.0 - RoughnessMISClamp, 1e-3)) : 1.0;
+
+			const float TPdf = ReservoirTargetPdf(R, Primary);
+			const float M = max(R.RadianceAndM.w, 1.0);
+			const float WeightSum = max(R.SamplePositionAndWeight.w, 0.0);
+			ReservoirWeight = WeightSum / M;
+
+			if (bVisible)
+			{
+				Indirect = EvaluateDiffuseBrdf(Primary, L) * R.RadianceAndM.rgb * TPdf * ReservoirWeight * MisWeight * GIIntensity;
+				Indirect = min(Indirect, (float3)RadianceClamp);
+			}
+		}
+
+		const float3 Composite = SceneColor + Indirect;
+
+		float3 OutColor = Composite;
+		FReSTIRGIPackedReservoir DebugReservoir = R;
+
+		if (DebugView == DEBUG_INDIRECT_ONLY)
+		{
+			OutColor = DebugToneMap(Indirect * 4.0);
+		}
+		else if (DebugView == DEBUG_INDIRECT_ONLY_LINEAR)
+		{
+			OutColor = Indirect;
+		}
+		else if (DebugView == DEBUG_INDIRECT_ONLY_TM)
+		{
+			OutColor = DebugToneMap(Indirect);
+		}
+		else if (DebugView == DEBUG_INDIRECT_RAW)
+		{
+			const float M = max(DebugReservoir.RadianceAndM.w, 1.0);
+			const float WeightSum = max(DebugReservoir.SamplePositionAndWeight.w, 0.0);
+			OutColor = DebugToneMap(DebugReservoir.RadianceAndM.rgb * (WeightSum / M) * GIIntensity);
+		}
+		else if (DebugView == DEBUG_HIT_MASK)
+		{
+			const FReSTIRGISurface Secondary = SecondarySurfaceBufferSRV[Index];
+			OutColor = Secondary.Misc.x > 0.0 ? float3(0.1, 0.85, 0.25) : float3(0.08, 0.08, 0.1);
+		}
+		else if (DebugView == DEBUG_SURFACE_VALIDITY)
+		{
+			OutColor = Primary.Misc.x > 0.0 ? float3(0.2, 0.55, 1.0) : float3(0.1, 0.05, 0.05);
+		}
+		else if (DebugView == DEBUG_INITIAL_RESERVOIR)
+		{
+			const FReSTIRGIPackedReservoir IR = InitialReservoir[Index];
+			const float M = max(IR.RadianceAndM.w, 1.0);
+			OutColor = DebugToneMap(IR.RadianceAndM.rgb * (max(IR.SamplePositionAndWeight.w, 0.0) / M));
+		}
+		else if (DebugView == DEBUG_TEMPORAL_RESERVOIR)
+		{
+			const FReSTIRGIPackedReservoir TR = TemporalReservoir[Index];
+			const float M = max(TR.RadianceAndM.w, 1.0);
+			OutColor = DebugToneMap(TR.RadianceAndM.rgb * (max(TR.SamplePositionAndWeight.w, 0.0) / M));
+		}
+		else if (DebugView == DEBUG_SPATIAL_RESERVOIR)
+		{
+			const FReSTIRGIPackedReservoir SR = SpatialReservoir[Index];
+			const float M = max(SR.RadianceAndM.w, 1.0);
+			OutColor = DebugToneMap(SR.RadianceAndM.rgb * (max(SR.SamplePositionAndWeight.w, 0.0) / M));
+		}
+		else if (DebugView == DEBUG_RESERVOIR_WEIGHT)
+		{
+			OutColor = Heat(saturate(ReservoirWeight * 0.5));
+		}
+		else if (DebugView == DEBUG_SAMPLE_AGE)
+		{
+			OutColor = Heat((float)DebugReservoir.Misc.x / max((float)MaxHistoryLength, 1.0));
+		}
+		else if (DebugView == DEBUG_SELECTED_SAMPLE)
+		{
+			const float3 Dir = SafeNormalize(DebugReservoir.SamplePositionAndWeight.xyz - Primary.WorldPositionAndDepth.xyz, float3(0, 0, 1));
+			OutColor = Dir * 0.5 + 0.5;
+		}
+		else if (DebugView == DEBUG_TARGET_PDF)
+		{
+			const float TPdf = ReservoirTargetPdf(DebugReservoir, Primary);
+			OutColor = Heat(saturate(TPdf * 0.01));
+		}
+		else if (DebugView == DEBUG_WEIGHT_SUM_M)
+		{
+			const float M = max(DebugReservoir.RadianceAndM.w, 1.0);
+			OutColor = Heat(saturate(max(DebugReservoir.SamplePositionAndWeight.w, 0.0) / M * 0.1));
+		}
+
+		// Lumen compare modes only affect Composite debug view
+		if (DebugView == DEBUG_COMPOSITE)
+		{
+			if (LumenCompareMode == LUMEN_WIPE)
+			{
+				OutColor = ((float)DispatchPixel.x / max((float)ViewRectSize.x, 1.0) < CompareSplit) ? Composite : SceneColor;
+			}
+			else if (LumenCompareMode == LUMEN_SIDE_BY_SIDE)
+			{
+				OutColor = (DispatchPixel.x < (uint)(ViewRectSize.x / 2)) ? Composite : SceneColor;
+			}
+		}
+
+		const uint2 CheckReservoir = BufferPixelToReservoirPixel(BufferPixel);
+		if (all(DispatchPixel == ReservoirPixelToBufferPixel(CheckReservoir) - (uint2)ViewRectMin))
+		{
+			HistoryPrimarySurfaceOutput[Index] = Primary;
+			HistoryReservoirOutput[Index] = R;
+		}
+
+		OutputTexture[BufferPixel] = float4(OutColor, 1.0);
+	}
+
+	if (bValidPixel)
+	{
+		InterlockedAdd(GS_StatValid, bFinalValid ? 1 : 0);
+		InterlockedAdd(GS_StatCount, 1);
+	}
+
+	FinalizeGroupStats(LocalIndex, 3);
 }

@@ -12,5 +12,12 @@ public:
 	virtual void ShutdownModule() override;
 
 private:
+	void RegisterViewExtension();
+	void RegisterRayTracingDelegates();
+	void UnregisterRayTracingDelegates();
+	void OnAnyRayTracingPassEnabled(bool& bAnyRayTracingPassEnabled);
+
 	TSharedPtr<FReSTIRGIViewExtension, ESPMode::ThreadSafe> ViewExtension;
+	FDelegateHandle PostEngineInitHandle;
+	FDelegateHandle AnyRayTracingPassEnabledHandle;
 };

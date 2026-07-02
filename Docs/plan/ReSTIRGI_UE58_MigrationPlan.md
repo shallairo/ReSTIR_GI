@@ -1,87 +1,64 @@
-# UE 5.8 ReSTIR GI Migration Plan
+# UE 5.8 ReSTIR GI 当前实现与后续计划
 
-## Goal
+## 当前目标
 
-This project implements a medium-scope ReSTIR GI learning and debugging path for UE 5.8. The first implementation lives in `Plugins/ReSTIRGI` and uses C++ modules, UE global shaders, RDG passes, and a pure Slate editor panel. Blueprints are intentionally not part of the workflow.
+`Plugins/ReSTIRGI` 当前实现的是面向学习和调试的一跳 ReSTIR GI 闭环。它保留纯 C++、RDG、Global Shader、Slate UI 工作流，不使用蓝图。
 
-The current implementation establishes the integration spine:
+本阶段优先保证三件事：
 
-- `ReSTIRGIRuntime` registers shader directory mappings, owns the SceneViewExtension, snapshots settings, and dispatches RDG compute passes.
-- `ReSTIRGIEditor` adds `Window > ReSTIR GI Debug` with controls for mode, debug view, reservoir history, spatial sampling, MIS, visibility, and realtime comparison.
-- `/Plugin/ReSTIRGI/ReSTIRGI.usf` contains the first shader-side reservoir representation and four-pass ReSTIR GI flow.
+- 算法路径真实存在：primary surface、secondary ray、reservoir、temporal/spatial resampling、final shading。
+- UI 逻辑清晰：算法模式、诊断视图、Lumen 对比分离。
+- 效果可验证：提供表面有效性、二次射线命中、仅看间接光、reservoir 权重和历史年龄视图。
 
-## Algorithm Scope
+## 当前实现
 
-Version 0.1 targets a compact but useful ReSTIR GI loop:
+- Runtime 使用 `FReSTIRGIViewExtension` 在 Tonemap 前接入 HDR post-process 链，避免多次叠加。
+- 使用 `UE::FXRenderingUtils::RayTracing::GetRayTracingSceneViewRDG` 获取 UE 5.8 公共 TLAS SRV。
+- `只看 ReSTIR GI` 模式下，ViewExtension 会将当前 view 的 `DynamicGlobalIlluminationMethod` 临时设为 `Plugin`，并通过 UE GI plugin ray tracing delegate 声明需要 RayTracingScene，避免关闭 Lumen 后 TLAS 不再构建。
+- Initial pass 从 GBuffer 重建 primary surface，并用 inline ray tracing 发射一条二次射线。
+- 二次射线方向默认使用 diffuse cosine sampling，后续可逐步恢复 diffuse/glossy 更完整的 MIS。
+- Secondary radiance 当前采用“命中点屏幕投影采样 HDR SceneColor + sky fallback”的近似方案。
+- Temporal pass 使用 depth、normal、history age 过滤并合并 history reservoir。
+- Spatial pass 使用 neighbor offset buffer、depth/normal 阈值和 targetPdf 合并邻域 reservoir。
+- Final pass 使用 primary diffuse BRDF、reservoir radiance、稳定权重、radiance clamp、GI intensity 输出 composite。
+- Slate 面板已收敛为算法模式、诊断视图、Lumen 对比、基础参数、高级参数和恢复默认值。
 
-1. Initial reservoir generation.
-2. Temporal reservoir reuse with ping-ponged history.
-3. Spatial neighbor resampling.
-4. Final composite and debug visualization.
+## 默认值策略
 
-The current shader uses SceneColor-derived proxy radiance so the plugin can be wired and debugged before the hardware ray tracing path is inserted. The next algorithm step is to replace `InitialSampleCS` with a ray tracing or ray query path that traces a secondary surface, shades it, and writes actual secondary-surface position, normal, radiance, pdf, throughput, and flags.
+默认值不追求“看起来最强”，而是追求“可验证、不过曝、稳定”：
 
-## UE Rendering Integration
+- `GIIntensity=0.35`
+- `RadianceClamp=3`
+- `SpatialSampleCount=4`
+- `SpatialRadius=8`
+- `MaxHistoryLength=12`
+- `MaxRayDistance=2500`
+- `NormalBias=1.5`
+- `BoilingFilterStrength=0.75`
+- `bHalfResolution=true`
+- `bFinalVisibility=false`
 
-Runtime integration is designed around UE renderer-native systems:
+如果需要演示效果，可以临时提高 `GIIntensity`，但验证完成后应回到推荐值。
 
-- `FReSTIRGIViewExtension` subscribes to the post-processing chain and receives `SceneColor` as the baseline input.
-- RDG buffers are allocated per view size for initial, temporal, spatial, and history reservoirs.
-- The history reservoir is extracted through RDG and re-registered on the next frame.
-- Resolution changes, explicit reset, and freeze toggles control history lifetime.
-- Final output is returned as an `FScreenPassTexture`, enabling composite, wipe compare, side-by-side, and heatmap debug modes.
+## UI 设计约束
 
-The later hardware RT phase should add:
+- `算法模式` 只控制 reservoir 阶段：关闭、初始采样、时间复用、空间复用、时间+空间复用。
+- `诊断视图` 只控制算法数据可视化：最终合成、仅看间接光、二次射线命中、Reservoir 权重、历史年龄、表面有效性。
+- `Lumen 对比` 只控制最终画面对比：叠加显示、只看 ReSTIR GI、只看 UE/Lumen、滑杆擦除、左右分屏。
+- 不再在 Debug View 中重复放置 Wipe/Side-by-side，避免和 Lumen Compare 逻辑冲突。
 
-- Ray tracing feature checks and user-facing disabled state.
-- Scene depth, normals, roughness, velocity, and view uniforms in shader parameters.
-- A real secondary-surface buffer with material approximation and pdf.
-- Optional final visibility ray support.
+## 当前限制
 
-## C++ and Shader Data Contract
+- 尚未实现完整 UE 材质 hit shader，二次命中点 radiance 不是完整材质照明。
+- 尚未迁移 RTXDI DI、ReGIR、mesh light、NRD denoiser。
+- temporal reprojection 仍以 reservoir 网格和 surface 过滤为主，尚未完整使用 velocity 历史像素重投影。
+- GPU timing 不再在 UI 中伪造 0 ms；真实时间通过 `ProfileGPU` 或 `stat GPU` 查看 `ReSTIRGI` RDG scope。
+- 当前方案用于学习和调试，不替代 Lumen 生产级 GI。
 
-The shared setting model is `FReSTIRGISettings`:
+## 下一步建议
 
-- Enable, resampling mode, debug view.
-- Spatial sample count, radius, normal/depth thresholds.
-- Max history, MIS clamp, radiance clamp, compare split.
-- MIS, final visibility, freeze history, reset history.
-
-The shader reservoir contract is `FReSTIRGIPackedReservoir`:
-
-- `SamplePositionAndWeight`: xyz sample position, w reservoir weight.
-- `SampleNormalAndPdf`: xyz sample normal, w sample pdf.
-- `RadianceAndM`: rgb radiance, w sample count.
-- `Misc`: age and future debug flags.
-
-This layout intentionally mirrors the RTXDI ReSTIR GI reservoir concept while staying local to UE shader code and avoiding a hard dependency on the currently incomplete `RTXDI-main/Libraries/Rtxdi` submodule.
-
-## Editor Debug UI
-
-The debug UI is implemented in C++ Slate:
-
-- Menu entry: `Window > ReSTIR GI Debug`.
-- Enable checkbox and mode selectors.
-- Controls for spatial samples, radius, max history, normal threshold, radiance clamp, and compare split.
-- Toggles for MIS, final visibility, and freeze history.
-- Reset history button.
-- Runtime stats for view size, reservoir memory, estimated rays per pixel, history validity, and ViewExtension activity.
-
-The UI only mutates C++ settings. Rendering comparison is performed by the RDG final composite pass. Console overrides are also available for quick validation: `r.ReSTIRGI.Enabled`, `r.ReSTIRGI.Mode`, and `r.ReSTIRGI.DebugView`; a value of `-1` defers to the Slate panel.
-
-## Next Engineering Steps
-
-1. Compile the plugin against the local UE 5.8 source build and fix API signature differences if the engine branch has changed post-processing extension types.
-2. Replace `InitialSampleCS` proxy radiance with a ray tracing or ray query shader that writes true secondary-surface reservoirs.
-3. Bind GBuffer inputs for depth, normals, roughness, and velocity; then upgrade temporal reprojection from same-pixel history to motion-vector reprojection.
-4. Add conservative visibility and final visibility rays behind toggles.
-5. Add GPU timing queries or RDG event statistics to fill the timing section of the editor panel.
-
-## Acceptance Checks
-
-- Project loads with the `ReSTIRGI` plugin enabled.
-- `Window > ReSTIR GI Debug` opens without Blueprints.
-- Enabling ReSTIR GI changes the viewport through the final composite pass.
-- `Initial Only`, `Temporal`, `Spatial`, `Temporal + Spatial`, `Heatmap`, `Wipe Compare`, and `Side By Side` modes produce distinct output.
-- History reset and resolution changes do not crash.
-- No RTXDI proprietary sample source is copied verbatim into project code.
+1. 接入 velocity reprojection，让 history reservoir 按上一帧像素位置读取。
+2. 增加 GPU reduction/readback，统计真实 valid reservoir ratio。
+3. 增加轻量 secondary hit lighting，用 emissive、skylight、directional light 估计替代纯 screen-projected radiance。
+4. 增加 bilateral/SVGF 风格滤波，降低仅一条 secondary ray 的噪声。
+5. 若追求更接近 Lumen，再评估更深的 Deferred Renderer 插入点。
