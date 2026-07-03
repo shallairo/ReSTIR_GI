@@ -3,6 +3,7 @@
 #include "CoreMinimal.h"
 #include "PostProcess/PostProcessMaterialInputs.h"
 #include "ReSTIRGISettings.h"
+#include "RHIGPUReadback.h"
 #include "RenderGraphResources.h"
 #include "SceneViewExtension.h"
 #include "ScreenPass.h"
@@ -28,9 +29,10 @@ private:
 
 	TRefCountPtr<FRDGPooledBuffer> HistoryReservoir;
 	TRefCountPtr<FRDGPooledBuffer> HistoryPrimarySurfaceBuffer;
-	TRefCountPtr<FRDGPooledBuffer> StatsReadbackBuffer;
+	TUniquePtr<FRHIGPUBufferReadback> StatsReadbackBuffer;
 	FIntPoint HistoryViewSize = FIntPoint::ZeroValue;
 	FIntPoint HistoryReservoirSize = FIntPoint::ZeroValue;
 	EReSTIRGILumenCompareMode LastLumenCompareMode = EReSTIRGILumenCompareMode::Overlay;
 	bool bHistoryValid = false;
+	bool bWasInPIE = false;
 };

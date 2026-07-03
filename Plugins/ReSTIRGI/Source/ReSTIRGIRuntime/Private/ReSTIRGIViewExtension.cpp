@@ -9,6 +9,8 @@
 #include "FXRenderingUtils.h"
 #include "GPUProfiler.h"
 #include "HAL/IConsoleManager.h"
+#include "Engine/Engine.h"
+#include "Engine/World.h"
 
 DECLARE_GPU_STAT_NAMED(ReSTIRGI, TEXT("ReSTIR GI"));
 
@@ -155,7 +157,7 @@ namespace
 		const FReSTIRGISettings& Settings,
 		const FIntPoint& ViewRectMin,
 		const FIntPoint& ViewRectSize,
-		const FIntPoint& BufferSize,
+		const FIntPoint& SceneColorTextureSize,
 		const FIntPoint& ReservoirSize,
 		const bool bHistoryValid,
 		const bool bRayTracingAvailable)
@@ -163,7 +165,7 @@ namespace
 		FReSTIRGICommonShaderParameters Parameters;
 		Parameters.ViewRectMin = ViewRectMin;
 		Parameters.ViewRectSize = ViewRectSize;
-		Parameters.BufferSize = BufferSize;
+		Parameters.SceneColorTextureSize = SceneColorTextureSize;
 		Parameters.ReservoirSize = ReservoirSize;
 		Parameters.FrameIndex = GFrameNumber;
 		Parameters.ResamplingMode = static_cast<uint32>(Settings.ResamplingMode);
@@ -198,6 +200,27 @@ namespace
 		static bool bStoredPreviousValues = false;
 		static int32 PreviousDiffuseIndirectAllow = 1;
 		static int32 PreviousReflectionsAllow = 1;
+
+		// Detect PIE transitions: static state must be reset when entering/exiting PIE
+		// because the original CVar values may differ between editor and game worlds.
+		if (GIsEditor && GIsPlayInEditorWorld)
+		{
+			static bool bWasInPIE = false;
+			if (!bWasInPIE)
+			{
+				bStoredPreviousValues = false;
+				bWasInPIE = true;
+			}
+		}
+		else
+		{
+			static bool bWasInPIE = false;
+			if (bWasInPIE)
+			{
+				bStoredPreviousValues = false;
+				bWasInPIE = false;
+			}
+		}
 
 		IConsoleVariable* LumenDiffuse = IConsoleManager::Get().FindConsoleVariable(TEXT("r.Lumen.DiffuseIndirect.Allow"));
 		IConsoleVariable* LumenReflections = IConsoleManager::Get().FindConsoleVariable(TEXT("r.Lumen.Reflections.Allow"));
@@ -313,6 +336,20 @@ void FReSTIRGIViewExtension::SetupView(FSceneViewFamily& InViewFamily, FSceneVie
 	{
 		InView.FinalPostProcessSettings.DynamicGlobalIlluminationMethod = EDynamicGlobalIlluminationMethod::Plugin;
 	}
+
+	// Detect PIE transition and force history reset when entering/exiting PIE.
+	// The render buffers from editor mode are not compatible with the game
+	// viewport, and vice versa.
+	if (IsInGameThread())
+	{
+		const bool bNowInPIE = GIsEditor && GIsPlayInEditorWorld;
+		if (bNowInPIE != bWasInPIE)
+		{
+			bWasInPIE = bNowInPIE;
+			// Defer the render-thread reset via the settings manager
+			FReSTIRGISettingsManager::RequestHistoryReset();
+		}
+	}
 }
 
 void FReSTIRGIViewExtension::BeginRenderViewFamily(FSceneViewFamily& InViewFamily)
@@ -370,6 +407,7 @@ void FReSTIRGIViewExtension::ResetHistory_RenderThread()
 FScreenPassTexture FReSTIRGIViewExtension::AddReSTIRGIPass_RenderThread(FRDGBuilder& GraphBuilder, const FSceneView& View, const FPostProcessMaterialInputs& Inputs)
 {
 	check(IsInRenderingThread());
+	ProcessStatsReadback();
 
 	FReSTIRGISettings Settings = FReSTIRGISettingsManager::GetSettings();
 	ApplyConsoleOverrides(Settings);
@@ -399,7 +437,7 @@ FScreenPassTexture FReSTIRGIViewExtension::AddReSTIRGIPass_RenderThread(FRDGBuil
 
 	const FIntPoint ViewRectMin = SceneColor.ViewRect.Min;
 	const FIntPoint ViewRectSize = SceneColor.ViewRect.Size();
-	const FIntPoint BufferSize = FIntPoint(SceneColor.Texture->Desc.GetSize().X, SceneColor.Texture->Desc.GetSize().Y);
+	const FIntPoint SceneColorTextureSize = FIntPoint(SceneColor.Texture->Desc.GetSize().X, SceneColor.Texture->Desc.GetSize().Y);
 	const FIntPoint ReservoirSize = Settings.bHalfResolution
 		? FIntPoint(FMath::DivideAndRoundUp(ViewRectSize.X, 2), FMath::DivideAndRoundUp(ViewRectSize.Y, 2))
 		: ViewRectSize;
@@ -441,7 +479,7 @@ FScreenPassTexture FReSTIRGIViewExtension::AddReSTIRGIPass_RenderThread(FRDGBuil
 	}
 
 	const FReSTIRGICommonShaderParameters CommonParameters = MakeCommonParameters(
-		Settings, ViewRectMin, ViewRectSize, BufferSize, ReservoirSize, bHistoryValid, bRayTracingAvailable);
+		Settings, ViewRectMin, ViewRectSize, SceneColorTextureSize, ReservoirSize, bHistoryValid, bRayTracingAvailable);
 	const FIntVector ReservoirGroupCount = FComputeShaderUtils::GetGroupCount(ReservoirSize, FIntPoint(GReSTIRGIThreadGroupSize, GReSTIRGIThreadGroupSize));
 	const FIntVector OutputGroupCount = FComputeShaderUtils::GetGroupCount(ViewRectSize, FIntPoint(GReSTIRGIThreadGroupSize, GReSTIRGIThreadGroupSize));
 	FGlobalShaderMap* ShaderMap = GetGlobalShaderMap(View.GetFeatureLevel());
@@ -477,6 +515,7 @@ FScreenPassTexture FReSTIRGIViewExtension::AddReSTIRGIPass_RenderThread(FRDGBuil
 	const bool bNeedsTemporalPass = Settings.ResamplingMode == EReSTIRGIResamplingMode::Temporal
 		|| Settings.ResamplingMode == EReSTIRGIResamplingMode::TemporalAndSpatial;
 	FRDGBufferRef FinalSourceReservoir = InitialReservoir;
+	bool bRanSpatialPass = false;
 
 	if (bNeedsTemporalPass)
 	{
@@ -518,11 +557,18 @@ FScreenPassTexture FReSTIRGIViewExtension::AddReSTIRGIPass_RenderThread(FRDGBuil
 		TShaderMapRef<FReSTIRGISpatialResamplingCS> Shader(ShaderMap);
 		FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("ReSTIRGI Spatial Resampling"), Shader, PassParameters, ReservoirGroupCount);
 		FinalSourceReservoir = SpatialReservoir;
+		bRanSpatialPass = true;
 	}
 
 	FRDGTextureDesc OutputDesc = SceneColor.Texture->Desc;
 	OutputDesc.Flags |= TexCreate_UAV | TexCreate_ShaderResource;
 	FRDGTextureRef OutputTexture = GraphBuilder.CreateTexture(OutputDesc, TEXT("ReSTIRGI.CompositeOutput"));
+
+	// Pre-fill OutputTexture with SceneColor so that any pixels outside the
+	// ViewRect (or unreachable by the FinalComposite dispatch) retain valid
+	// data instead of displaying uninitialized/garbage — the most common cause
+	// of a black screen when entering PIE.
+	AddCopyTexturePass(GraphBuilder, SceneColor.Texture, OutputTexture, FRHICopyTextureInfo());
 
 	{
 		FReSTIRGIFinalCompositeCS::FParameters* PassParameters = GraphBuilder.AllocParameters<FReSTIRGIFinalCompositeCS::FParameters>();
@@ -535,9 +581,9 @@ FScreenPassTexture FReSTIRGIViewExtension::AddReSTIRGIPass_RenderThread(FRDGBuil
 		PassParameters->PrimarySurfaceBufferSRV = GraphBuilder.CreateSRV(PrimarySurfaceBuffer);
 		PassParameters->SecondarySurfaceBufferSRV = GraphBuilder.CreateSRV(SecondarySurfaceBuffer);
 		PassParameters->FinalReservoir = GraphBuilder.CreateSRV(FinalSourceReservoir);
-		PassParameters->InitialReservoir = GraphBuilder.CreateUAV(InitialReservoir);
-		PassParameters->TemporalReservoir = GraphBuilder.CreateUAV(TemporalReservoir);
-		PassParameters->SpatialReservoir = GraphBuilder.CreateUAV(SpatialReservoir);
+		PassParameters->DebugInitialReservoir = GraphBuilder.CreateSRV(InitialReservoir);
+		PassParameters->DebugTemporalReservoir = GraphBuilder.CreateSRV(bNeedsTemporalPass ? TemporalReservoir : InitialReservoir);
+		PassParameters->DebugSpatialReservoir = GraphBuilder.CreateSRV(bRanSpatialPass ? SpatialReservoir : FinalSourceReservoir);
 		PassParameters->HistoryPrimarySurfaceOutput = GraphBuilder.CreateUAV(HistoryPrimarySurfaceOutput);
 		PassParameters->HistoryReservoirOutput = GraphBuilder.CreateUAV(HistoryOutputReservoir);
 		PassParameters->OutputTexture = GraphBuilder.CreateUAV(OutputTexture);
@@ -556,8 +602,14 @@ FScreenPassTexture FReSTIRGIViewExtension::AddReSTIRGIPass_RenderThread(FRDGBuil
 		bHistoryValid = true;
 	}
 
-	// Extract stats buffer for readback
-	GraphBuilder.QueueBufferExtraction(StatsBuffer, &StatsReadbackBuffer);
+	if (!StatsReadbackBuffer.IsValid())
+	{
+		StatsReadbackBuffer = MakeUnique<FRHIGPUBufferReadback>(FName(TEXT("ReSTIRGI.StatsReadback")));
+	}
+	if (StatsReadbackBuffer->IsReady())
+	{
+		AddEnqueueCopyPass(GraphBuilder, StatsReadbackBuffer.Get(), StatsBuffer, sizeof(FReSTIRGIStats) * 4);
+	}
 
 	Stats.ViewSize = ViewRectSize;
 	Stats.ReservoirSize = ReservoirSize;
@@ -573,8 +625,35 @@ FScreenPassTexture FReSTIRGIViewExtension::AddReSTIRGIPass_RenderThread(FRDGBuil
 
 void FReSTIRGIViewExtension::ProcessStatsReadback()
 {
-	// Release the previous frame's stats buffer. GPU readback via TryLock is not
-	// directly available on FRDGPooledBuffer; stats ratios remain at -1.0 (N/A)
-	// in the UI until a proper RHIGPUBufferReadback integration is added.
-	StatsReadbackBuffer.SafeRelease();
+	if (!StatsReadbackBuffer.IsValid() || !StatsReadbackBuffer->IsReady())
+	{
+		return;
+	}
+
+	constexpr uint32 StatsCount = 4;
+	const FReSTIRGIStats* StatsData = static_cast<const FReSTIRGIStats*>(StatsReadbackBuffer->Lock(sizeof(FReSTIRGIStats) * StatsCount));
+	if (!StatsData)
+	{
+		StatsReadbackBuffer->Unlock();
+		return;
+	}
+
+	FReSTIRGIRuntimeStats RuntimeStats = FReSTIRGISettingsManager::GetStats();
+	const auto SafeRatio = [](const uint32 Value, const uint32 Count) -> float
+	{
+		return Count > 0 ? static_cast<float>(Value) / static_cast<float>(Count) : -1.0f;
+	};
+
+	const FReSTIRGIStats& Initial = StatsData[0];
+	const FReSTIRGIStats& Temporal = StatsData[1];
+	const FReSTIRGIStats& Spatial = StatsData[2];
+
+	RuntimeStats.PrimaryValidRatio = SafeRatio(Initial.PrimaryValidAndHitAndInitValid.X, Initial.PrimaryValidAndHitAndInitValid.W);
+	RuntimeStats.SecondaryHitRate = SafeRatio(Initial.PrimaryValidAndHitAndInitValid.Y, Initial.PrimaryValidAndHitAndInitValid.W);
+	RuntimeStats.InitialValidRatio = SafeRatio(Initial.PrimaryValidAndHitAndInitValid.Z, Initial.PrimaryValidAndHitAndInitValid.W);
+	RuntimeStats.TemporalValidRatio = SafeRatio(Temporal.PrimaryValidAndHitAndInitValid.Z, Temporal.PrimaryValidAndHitAndInitValid.W);
+	RuntimeStats.SpatialValidRatio = SafeRatio(Spatial.PrimaryValidAndHitAndInitValid.Z, Spatial.PrimaryValidAndHitAndInitValid.W);
+
+	StatsReadbackBuffer->Unlock();
+	FReSTIRGISettingsManager::UpdateStats(RuntimeStats);
 }

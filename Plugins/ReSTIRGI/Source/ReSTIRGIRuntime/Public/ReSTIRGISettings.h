@@ -50,7 +50,7 @@ enum class EReSTIRGIRadianceMode : uint8
 struct FReSTIRGISettings
 {
 	bool bEnabled = false;
-	bool bFinalMIS = true;
+	bool bFinalMIS = false; // MIS weight was attenuating diffuse-only signal by ~3x
 	bool bFinalVisibility = false;
 	bool bFreezeHistory = false;
 	bool bResetHistory = false;
@@ -69,14 +69,14 @@ struct FReSTIRGISettings
 	float DepthThreshold = 0.06f;
 	float RoughnessMISClamp = 0.25f;
 	float RadianceClamp = 3.0f;
-	float GIIntensity = 1.0f;
+	float GIIntensity = 10.0f;  // Single-bounce RIS signal is inherently small; needs amplification
 	float CompareSplit = 0.5f;
 	float MaxRayDistance = 2500.0f;
 	float NormalBias = 1.5f;
 	float DiffuseRayProbability = 1.0f;
 	float SecondaryRoughnessClamp = 0.5f;
 	float BoilingFilterStrength = 0.75f;
-	float SyntheticConstantIntensity = 0.5f;
+	float SyntheticConstantIntensity = 2.0f;  // Boosted for visible synthetic test signal
 };
 
 struct FReSTIRGIRuntimeStats
